@@ -17,6 +17,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var resolutionSpinner: Spinner
     private lateinit var codecSpinner: Spinner
     private lateinit var reportView: TextView
+    private lateinit var liteModeCheckbox: CheckBox
     private lateinit var startStopButton: Button
     private lateinit var permButton: Button
 
@@ -86,6 +87,16 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(reportView)
 
+        liteModeCheckbox = CheckBox(this).apply {
+            text = "Lite Mode (для слабых процессоров — 720p, H.264, 60fps макс., без форсирования Hz экрана)"
+            setOnCheckedChangeListener { _, checked ->
+                fpsSpinner.isEnabled = !checked
+                resolutionSpinner.isEnabled = !checked
+                codecSpinner.isEnabled = !checked
+            }
+        }
+        root.addView(liteModeCheckbox)
+
         permButton = Button(this).apply {
             text = "Выдать разрешение на изменение настроек экрана"
             setOnClickListener { requestWriteSettings() }
@@ -131,8 +142,8 @@ class MainActivity : AppCompatActivity() {
         if (isRecording) {
             stopRecordService()
         } else {
-            if (!Settings.System.canWrite(this)) {
-                Toast.makeText(this, "Сначала выдай разрешение на изменение настроек экрана — иначе частота 90Hz не зафиксируется", Toast.LENGTH_LONG).show()
+            if (!liteModeCheckbox.isChecked && !Settings.System.canWrite(this)) {
+                Toast.makeText(this, "Сначала выдай разрешение на изменение настроек экрана — иначе частота Hz не зафиксируется", Toast.LENGTH_LONG).show()
                 return
             }
             projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
@@ -140,9 +151,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun launchRecordService(resultCode: Int, data: Intent) {
-        val fps = fpsOptions[fpsSpinner.selectedItemPosition]
-        val (w, h) = resolutionOptions[resolutionSpinner.selectedItemPosition].second
-        val mime = codecOptions[codecSpinner.selectedItemPosition].second
+        val liteMode = liteModeCheckbox.isChecked
+
+        val fps: Int
+        val w: Int
+        val h: Int
+        val mime: String
+        val bitrate: Int
+        val skipRefreshLock: Boolean
+
+        if (liteMode) {
+            fps = fpsOptions[fpsSpinner.selectedItemPosition].coerceAtMost(60)
+            w = 1280
+            h = 720
+            mime = MediaFormat.MIMETYPE_VIDEO_AVC
+            bitrate = 6_000_000
+            skipRefreshLock = true
+        } else {
+            fps = fpsOptions[fpsSpinner.selectedItemPosition]
+            val res = resolutionOptions[resolutionSpinner.selectedItemPosition].second
+            w = res.first
+            h = res.second
+            mime = codecOptions[codecSpinner.selectedItemPosition].second
+            bitrate = if (w >= 1920) 16_000_000 else 10_000_000
+            skipRefreshLock = false
+        }
 
         val intent = Intent(this, RecordService::class.java).apply {
             putExtra(RecordService.EXTRA_RESULT_CODE, resultCode)
@@ -150,8 +183,9 @@ class MainActivity : AppCompatActivity() {
             putExtra(RecordService.EXTRA_WIDTH, w)
             putExtra(RecordService.EXTRA_HEIGHT, h)
             putExtra(RecordService.EXTRA_FPS, fps)
-            putExtra(RecordService.EXTRA_BITRATE, if (w >= 1920) 16_000_000 else 10_000_000)
+            putExtra(RecordService.EXTRA_BITRATE, bitrate)
             putExtra(RecordService.EXTRA_MIME, mime)
+            putExtra(RecordService.EXTRA_SKIP_REFRESH_LOCK, skipRefreshLock)
         }
         ContextCompat.startForegroundService(this, intent)
         isRecording = true

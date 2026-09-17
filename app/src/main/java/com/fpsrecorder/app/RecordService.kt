@@ -29,6 +29,7 @@ class RecordService : Service() {
         const val EXTRA_FPS = "fps"
         const val EXTRA_BITRATE = "bitrate"
         const val EXTRA_MIME = "mime"
+        const val EXTRA_SKIP_REFRESH_LOCK = "skip_refresh_lock"
         const val ACTION_STOP = "com.fpsrecorder.app.STOP"
         private const val TAG = "RecordService"
     }
@@ -71,6 +72,7 @@ class RecordService : Service() {
         val requestedFps = intent?.getIntExtra(EXTRA_FPS, 60) ?: 60
         val bitrate = intent?.getIntExtra(EXTRA_BITRATE, 12_000_000) ?: 12_000_000
         val mime = intent?.getStringExtra(EXTRA_MIME) ?: MediaFormat.MIMETYPE_VIDEO_AVC
+        val skipRefreshLock = intent?.getBooleanExtra(EXTRA_SKIP_REFRESH_LOCK, false) ?: false
 
         startForeground(1, buildNotification())
 
@@ -102,7 +104,11 @@ class RecordService : Service() {
             }
         }
 
-        lockRefreshRate(effectiveFps)
+        if (!skipRefreshLock) {
+            if (!skipRefreshLock) {
+            lockRefreshRate(effectiveFps)
+        }
+        }
 
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = mpm.getMediaProjection(resultCode, resultData)
