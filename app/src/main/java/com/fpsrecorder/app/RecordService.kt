@@ -1,6 +1,7 @@
 package com.fpsrecorder.app
 
 import android.app.*
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.hardware.display.DisplayManager
@@ -8,7 +9,9 @@ import android.hardware.display.VirtualDisplay
 import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.*
+import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
 import android.view.Surface
@@ -44,6 +47,11 @@ class RecordService : Service() {
 
     private var originalMinRefreshRate: String? = null
     private var originalPeakRefreshRate: String? = null
+
+    // Для сохранения в Галерею
+    private var outputUri: Uri? = null
+    private var outputPfd: ParcelFileDescriptor? = null
+    private var legacyOutputFile: File? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -108,6 +116,69 @@ class RecordService : Service() {
         }
     }
 
+    /**
+     * Создаёт MediaMuxer, который пишет сразу в публичную коллекцию Movies —
+     * чтобы файл появился в Галерее без дополнительных шагов.
+     * Android 10+ (API 29+) требует MediaStore API вместо прямого File-пути.
+     */
+    private fun createMuxer(mime: String): MediaMuxer {
+        val fileName = "fps_record_${System.currentTimeMillis()}.mp4"
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/FpsRecorder")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("Не удалось создать запись в MediaStore")
+            outputUri = uri
+
+            val pfd = contentResolver.openFileDescriptor(uri, "rw")
+                ?: throw IllegalStateException("Не удалось открыть файловый дескриптор")
+            outputPfd = pfd
+
+            MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        } else {
+            @Suppress("DEPRECATION")
+            val moviesDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), "FpsRecorder")
+            if (!moviesDir.exists()) moviesDir.mkdirs()
+            val outFile = File(moviesDir, fileName)
+            legacyOutputFile = outFile
+
+            MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        }
+    }
+
+    /**
+     * После остановки записи "публикует" файл — снимает флаг IS_PENDING (API 29+)
+     * или явно просит систему просканировать файл (API < 29), иначе он не появится
+     * в Галерее/файловом менеджере до перезагрузки.
+     */
+    private fun finalizeOutputFile() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            outputUri?.let { uri ->
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.IS_PENDING, 0)
+                }
+                try {
+                    contentResolver.update(uri, values, null, null)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Не удалось финализировать файл в MediaStore: ${e.message}")
+                }
+            }
+            try {
+                outputPfd?.close()
+            } catch (_: Exception) {
+            }
+        } else {
+            legacyOutputFile?.let { file ->
+                MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), arrayOf("video/mp4"), null)
+            }
+        }
+    }
+
     private fun startEncoding(width: Int, height: Int, fps: Int, bitrate: Int, mime: String) {
         encoderThread = HandlerThread("EncoderThread").also { it.start() }
         encoderHandler = Handler(encoderThread!!.looper)
@@ -126,8 +197,7 @@ class RecordService : Service() {
             start()
         }
 
-        val outFile = File(getExternalFilesDir(null), "fps_record_${System.currentTimeMillis()}.mp4")
-        muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        muxer = createMuxer(mime)
 
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "FpsRecorderDisplay",
@@ -176,12 +246,6 @@ class RecordService : Service() {
         })
     }
 
-    /**
-     * Остановка запускается ЧЕРЕЗ ТОТ ЖЕ поток, что и цикл дренажа (encoderHandler),
-     * а не напрямую — иначе получается гонка потоков: drainEncoderLoop ещё крутится
-     * и трогает encoder/muxer в момент, когда их уже освободили с другого потока.
-     * Именно это раньше вызывало нестабильный краш при "Стоп".
-     */
     private fun stopRecording() {
         if (isStopping) return
         isStopping = true
@@ -247,6 +311,7 @@ class RecordService : Service() {
             }
             muxer?.release()
             mediaProjection?.stop()
+            finalizeOutputFile()
         } catch (e: Exception) {
             Log.e(TAG, "Ошибка при остановке: ${e.message}")
         } finally {
