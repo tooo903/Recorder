@@ -15,6 +15,7 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
 import android.view.Surface
+import android.widget.Toast
 import java.io.File
 
 class RecordService : Service() {
@@ -48,7 +49,6 @@ class RecordService : Service() {
     private var originalMinRefreshRate: String? = null
     private var originalPeakRefreshRate: String? = null
 
-    // Для сохранения в Галерею
     private var outputUri: Uri? = null
     private var outputPfd: ParcelFileDescriptor? = null
     private var legacyOutputFile: File? = null
@@ -68,7 +68,7 @@ class RecordService : Service() {
         val resultData: Intent? = intent?.getParcelableExtra(EXTRA_RESULT_DATA)
         val width = intent?.getIntExtra(EXTRA_WIDTH, 1280) ?: 1280
         val height = intent?.getIntExtra(EXTRA_HEIGHT, 720) ?: 720
-        val fps = intent?.getIntExtra(EXTRA_FPS, 60) ?: 60
+        val requestedFps = intent?.getIntExtra(EXTRA_FPS, 60) ?: 60
         val bitrate = intent?.getIntExtra(EXTRA_BITRATE, 12_000_000) ?: 12_000_000
         val mime = intent?.getStringExtra(EXTRA_MIME) ?: MediaFormat.MIMETYPE_VIDEO_AVC
 
@@ -80,12 +80,34 @@ class RecordService : Service() {
             return START_NOT_STICKY
         }
 
-        lockRefreshRate(fps)
+        // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: не просим у энкодера больше, чем он реально может.
+        // Раньше requestedFps шёл напрямую в KEY_FRAME_RATE, даже если аппаратный
+        // энкодер физически не тянет — это переполняло буфер и роняло плавность
+        // всей системы, а не только записи.
+        val encoderInfo = CodecCapabilities.probe(width, height, requestedFps, mime)
+        val effectiveFps = if (encoderInfo != null && !encoderInfo.supportsRequestedFps) {
+            encoderInfo.maxFpsAtResolution.toInt().coerceAtLeast(1)
+        } else {
+            requestedFps
+        }
+
+        if (effectiveFps < requestedFps) {
+            Log.w(TAG, "Энкодер не тянет $requestedFps fps на ${width}x$height, снижаю до $effectiveFps")
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(
+                    this,
+                    "Энкодер не тянет $requestedFps fps на этом разрешении — записываю $effectiveFps fps",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+
+        lockRefreshRate(effectiveFps)
 
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = mpm.getMediaProjection(resultCode, resultData)
 
-        startEncoding(width, height, fps, bitrate, mime)
+        startEncoding(width, height, effectiveFps, bitrate, mime)
 
         return START_STICKY
     }
@@ -116,11 +138,6 @@ class RecordService : Service() {
         }
     }
 
-    /**
-     * Создаёт MediaMuxer, который пишет сразу в публичную коллекцию Movies —
-     * чтобы файл появился в Галерее без дополнительных шагов.
-     * Android 10+ (API 29+) требует MediaStore API вместо прямого File-пути.
-     */
     private fun createMuxer(mime: String): MediaMuxer {
         val fileName = "fps_record_${System.currentTimeMillis()}.mp4"
 
@@ -151,11 +168,6 @@ class RecordService : Service() {
         }
     }
 
-    /**
-     * После остановки записи "публикует" файл — снимает флаг IS_PENDING (API 29+)
-     * или явно просит систему просканировать файл (API < 29), иначе он не появится
-     * в Галерее/файловом менеджере до перезагрузки.
-     */
     private fun finalizeOutputFile() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             outputUri?.let { uri ->
