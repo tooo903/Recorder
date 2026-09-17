@@ -39,7 +39,9 @@ class RecordService : Service() {
     private var encoderThread: HandlerThread? = null
     private var encoderHandler: Handler? = null
 
-    // Чтобы вернуть пользователю его исходную частоту обновления после записи
+    @Volatile
+    private var isStopping = false
+
     private var originalMinRefreshRate: String? = null
     private var originalPeakRefreshRate: String? = null
 
@@ -51,7 +53,6 @@ class RecordService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopRecording()
-            stopSelf()
             return START_NOT_STICKY
         }
 
@@ -81,12 +82,6 @@ class RecordService : Service() {
         return START_STICKY
     }
 
-    /**
-     * Ключевой момент: EMUI/Android может тихо занижать частоту обновления
-     * до 60Hz на время активного MediaProjection ради энергосбережения.
-     * Явно просим систему держать min и peak refresh rate на нужном значении.
-     * Требует разрешения WRITE_SETTINGS (пользователь выдаёт его вручную из UI).
-     */
     private fun lockRefreshRate(fps: Int) {
         if (!Settings.System.canWrite(this)) {
             Log.w(TAG, "Нет разрешения WRITE_SETTINGS — не могу зафиксировать частоту экрана")
@@ -120,12 +115,8 @@ class RecordService : Service() {
         val format = MediaFormat.createVideoFormat(mime, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-            // Жёстко задаём FPS энкодера — не отдаём системе на откуп "естественный" темп кадров,
-            // иначе при просадках она сама начнёт дропать кадры неравномерно, что и ощущается как рывки.
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
-            // Ключевой параметр против джиттера: постоянный поток кадров на входе,
-            // энкодер не должен "ждать" — это сглаживает микрозадержки композитора.
             setInteger(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000 / fps)
         }
 
@@ -152,6 +143,8 @@ class RecordService : Service() {
         encoderHandler?.post(object : Runnable {
             val bufferInfo = MediaCodec.BufferInfo()
             override fun run() {
+                if (isStopping) return
+
                 val codec = encoder ?: return
                 var running = true
                 while (running) {
@@ -176,19 +169,81 @@ class RecordService : Service() {
                         }
                     }
                 }
-                encoderHandler?.postDelayed(this, 5)
+                if (!isStopping) {
+                    encoderHandler?.postDelayed(this, 5)
+                }
             }
         })
     }
 
+    /**
+     * Остановка запускается ЧЕРЕЗ ТОТ ЖЕ поток, что и цикл дренажа (encoderHandler),
+     * а не напрямую — иначе получается гонка потоков: drainEncoderLoop ещё крутится
+     * и трогает encoder/muxer в момент, когда их уже освободили с другого потока.
+     * Именно это раньше вызывало нестабильный краш при "Стоп".
+     */
     private fun stopRecording() {
+        if (isStopping) return
+        isStopping = true
+
+        val handler = encoderHandler
+        if (handler == null) {
+            releaseAll()
+            return
+        }
+
+        handler.post {
+            try {
+                encoder?.signalEndOfInputStream()
+                drainRemainingOutput()
+            } catch (e: Exception) {
+                Log.e(TAG, "Ошибка при финальном дренаже: ${e.message}")
+            } finally {
+                releaseAll()
+            }
+        }
+    }
+
+    private fun drainRemainingOutput() {
+        val codec = encoder ?: return
+        val bufferInfo = MediaCodec.BufferInfo()
+        var sawEos = false
+        var attempts = 0
+
+        while (!sawEos && attempts < 50) {
+            val outIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000)
+            when {
+                outIndex >= 0 -> {
+                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        sawEos = true
+                    }
+                    val encodedData = codec.getOutputBuffer(outIndex)
+                    if (encodedData != null && bufferInfo.size > 0 && muxerStarted) {
+                        encodedData.position(bufferInfo.offset)
+                        encodedData.limit(bufferInfo.offset + bufferInfo.size)
+                        muxer?.writeSampleData(trackIndex, encodedData, bufferInfo)
+                    }
+                    codec.releaseOutputBuffer(outIndex, false)
+                }
+                outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    trackIndex = muxer?.addTrack(codec.outputFormat) ?: -1
+                    muxer?.start()
+                    muxerStarted = true
+                }
+                outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                    attempts++
+                }
+            }
+        }
+    }
+
+    private fun releaseAll() {
         try {
             virtualDisplay?.release()
-            encoder?.signalEndOfInputStream()
             encoder?.stop()
             encoder?.release()
             if (muxerStarted) {
-                muxer?.stop()
+                try { muxer?.stop() } catch (_: Exception) {}
             }
             muxer?.release()
             mediaProjection?.stop()
@@ -197,11 +252,16 @@ class RecordService : Service() {
         } finally {
             encoderThread?.quitSafely()
             restoreRefreshRate()
+            Handler(Looper.getMainLooper()).post {
+                stopSelf()
+            }
         }
     }
 
     override fun onDestroy() {
-        stopRecording()
+        if (!isStopping) {
+            stopRecording()
+        }
         super.onDestroy()
     }
 
