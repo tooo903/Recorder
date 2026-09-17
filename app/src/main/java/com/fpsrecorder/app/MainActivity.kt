@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.*
+import android.widget.ScrollView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 
@@ -109,7 +110,10 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(startStopButton)
 
-        setContentView(root)
+        val scrollView = ScrollView(this).apply {
+            addView(root)
+        }
+        setContentView(scrollView)
         runCodecReport()
     }
 
